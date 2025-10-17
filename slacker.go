@@ -1,0 +1,200 @@
+package slacker
+
+import (
+	"context"
+	"log/slog"
+
+	"github.com/google/uuid"
+	"github.com/patrickmn/go-cache"
+	"github.com/slack-go/slack"
+	"github.com/slack-go/slack/socketmode"
+)
+
+const SlackerEventID string = "slacker_event_id"
+
+// We mentioned that there were a few different types of interaction payloads your app might receive.
+// They'll be sent to your specified Request URL in an HTTP POST request in the form application/x-www-form-urlencoded.
+// For more information, refer to Using the Slack Web API: Basics.
+// The body of the request will contain a payload parameter; your app should parse this payload parameter as JSON.
+// The resulting object can have different structures depending on the source. All those structures will have a type field that indicates the source of the interaction. Our reference docs have a more detailed look at the payload structures for the different type sources:
+// - block_actions payloads are received when a user clicks a Block Kit interactive component.
+// - shortcut and message_actions payloads are received when global and message shortcuts are used.
+// - view_submission payloads are received when a modal is submitted.
+// - view_closed payloads are received when a modal is canceled.
+//
+// Interaction ->
+// 	InteractionTypeDialogCancellation = InteractionType("dialog_cancellation")
+// InteractionTypeDialogSubmission   = InteractionType("dialog_submission")
+// InteractionTypeDialogSuggestion   = InteractionType("dialog_suggestion")
+// InteractionTypeInteractionMessage = InteractionType("interactive_message")
+// InteractionTypeMessageAction      = InteractionType("message_action")
+// InteractionTypeBlockActions       = InteractionType("block_actions")
+// InteractionTypeBlockSuggestion    = InteractionType("block_suggestion")
+// InteractionTypeViewSubmission     = InteractionType("view_submission")
+// InteractionTypeViewClosed         = InteractionType("view_closed")
+// InteractionTypeShortcut           = InteractionType("shortcut")
+// InteractionTypeWorkflowStepEdit   = InteractionType("workflow_step_edit")
+//
+// Action Type ->
+// AttachmentAction
+// BlockAction
+
+// 1. Pipe Function to Inject Custom ID into the socketmodehandler.Event
+// 2. GetState(either ctx or event),
+// 3. ChatMessageWithContext(), encapsulate the message blocks with custom id that we store in the cache
+// 4.
+type Slacker struct {
+	cache    *cache.Cache
+	shandler *socketmode.SocketmodeHandler
+	logger   *slog.Logger
+}
+
+func New(cache *cache.Cache, socketmodeHandler *socketmode.SocketmodeHandler, logger *slog.Logger) *Slacker {
+	return &Slacker{
+		cache:    cache,
+		shandler: socketmodeHandler,
+		logger:   logger,
+	}
+}
+
+type SlackerHandler func(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error
+type SlackerSlashCommandHandler func(ctx context.Context, payload slack.SlashCommand, c *socketmode.Client) error
+
+type SlackerStep struct {
+	StepName  string
+	EventType socketmode.EventType
+	Handler   SlackerHandler
+
+	// If EventType is SlashCommand
+	slashCommand        string
+	slashCommandHandler SlackerSlashCommandHandler
+
+	interactionType slack.InteractionType
+}
+
+func Handle(stepName string, eventType socketmode.EventType, handler SlackerHandler) SlackerStep {
+	return SlackerStep{
+		StepName:  stepName,
+		EventType: eventType,
+		Handler:   handler,
+	}
+}
+
+func HandleSlashCommand(stepName string, slashCommand string, handler SlackerSlashCommandHandler) SlackerStep {
+	return SlackerStep{
+		StepName:            stepName,
+		EventType:           socketmode.EventTypeSlashCommand,
+		slashCommand:        slashCommand,
+		slashCommandHandler: handler,
+	}
+}
+
+func HandleInteraction(stepName string, interactionType slack.InteractionType, handler SlackerHandler) SlackerStep {
+	return SlackerStep{
+		StepName:        stepName,
+		EventType:       socketmode.EventTypeSlashCommand,
+		Handler:         handler,
+		interactionType: interactionType,
+	}
+}
+
+func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
+
+	for _, step := range pipelines {
+
+		switch step.EventType {
+		case socketmode.EventTypeSlashCommand:
+			sl.shandler.HandleSlashCommand(step.slashCommand, func(e *socketmode.Event, c *socketmode.Client) {
+
+				ctx := sl.extractSlackerEventIDToContext(e)
+
+				payload, ok := e.Data.(slack.SlashCommand)
+				if !ok {
+					return
+				}
+
+				err := step.slashCommandHandler(ctx, payload, c)
+				if err != nil {
+					sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
+				}
+
+			})
+
+		case socketmode.EventTypeInteractive:
+
+			if step.interactionType != "" {
+				sl.shandler.HandleInteraction(step.interactionType, func(e *socketmode.Event, c *socketmode.Client) {
+					ctx := sl.extractSlackerEventIDToContext(e)
+
+					err := step.Handler(ctx, e, c)
+					if err != nil {
+						sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
+					}
+
+				})
+			}
+
+		}
+	}
+
+	// sl.shandler.HandleInteraction(slack.InteractionTypeViewSubmission, func(e *socketmode.Event, c *socketmode.Client) {
+	// 	ctx := sl.extractSlackerEventIDToContext(e)
+	// 	err := fn(ctx, e, c)
+	// 	if err != nil {
+	// 		sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
+	// 	}
+	// })
+}
+
+// InteractionCallback.View -> View.PrivateMetadata
+// InteractionCallback.PostMessage (Blocks) -> Blocks.Action.ActionID = "slacker_event_id"
+func ExampleHandler(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
+	return nil
+}
+
+func (sl *Slacker) extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
+
+	sl.AddPipeline(
+		"user_internal_invitation",
+		Handle("submit_approval_brand", socketmode.EventTypeInteractive, ExampleHandler),
+	)
+
+	slackerEventId := uuid.NewString()
+
+	ctx := context.Background()
+
+	switch e.Type {
+	case socketmode.EventTypeInteractive:
+		payload, ok := e.Data.(slack.InteractionCallback)
+		if !ok {
+			return ctx
+		}
+
+		switch payload.Type {
+		case slack.InteractionTypeViewSubmission, slack.InteractionTypeViewClosed:
+			slackerEventId = payload.View.PrivateMetadata
+		case slack.InteractionTypeBlockActions:
+			if eventId, found := extractFromBlockActions(payload.ActionCallback.BlockActions); found {
+				slackerEventId = eventId
+			}
+		}
+
+	case socketmode.EventTypeEventsAPI:
+	default:
+	}
+
+	ctx = context.WithValue(ctx, SlackerEventID, slackerEventId)
+
+	return ctx
+}
+
+func extractFromBlockActions(blockActions []*slack.BlockAction) (string, bool) {
+	for _, action := range blockActions {
+		// Return when action_id already have slacker_event_id
+		if action.ActionID == SlackerEventID {
+			return action.Value, true
+		}
+	}
+
+	return "", false
+}
