@@ -2,7 +2,6 @@ package slacker
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
@@ -11,47 +10,41 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-const SlackerEventIDKey string = "slacker_event_id"
-const SlackerPayloadKey string = "slacker_payload"
+type contextKey string
 
-// We mentioned that there were a few different types of interaction payloads your app might receive.
-// They'll be sent to your specified Request URL in an HTTP POST request in the form application/x-www-form-urlencoded.
-// For more information, refer to Using the Slack Web API: Basics.
-// The body of the request will contain a payload parameter; your app should parse this payload parameter as JSON.
-// The resulting object can have different structures depending on the source. All those structures will have a type field that indicates the source of the interaction. Our reference docs have a more detailed look at the payload structures for the different type sources:
-// - block_actions payloads are received when a user clicks a Block Kit interactive component.
-// - shortcut and message_actions payloads are received when global and message shortcuts are used.
-// - view_submission payloads are received when a modal is submitted.
-// - view_closed payloads are received when a modal is canceled.
-//
-// Interaction ->
-// 	InteractionTypeDialogCancellation = InteractionType("dialog_cancellation")
-// InteractionTypeDialogSubmission   = InteractionType("dialog_submission")
-// InteractionTypeDialogSuggestion   = InteractionType("dialog_suggestion")
-// InteractionTypeInteractionMessage = InteractionType("interactive_message")
-// InteractionTypeMessageAction      = InteractionType("message_action")
-// InteractionTypeBlockActions       = InteractionType("block_actions")
-// InteractionTypeBlockSuggestion    = InteractionType("block_suggestion")
-// InteractionTypeViewSubmission     = InteractionType("view_submission")
-// InteractionTypeViewClosed         = InteractionType("view_closed")
-// InteractionTypeShortcut           = InteractionType("shortcut")
-// InteractionTypeWorkflowStepEdit   = InteractionType("workflow_step_edit")
-//
-// Action Type ->
-// AttachmentAction
-// BlockAction
+func (c contextKey) String() string {
+	return string(c)
+}
 
-// 1. Pipe Function to Inject Custom ID into the socketmodehandler.Event
-// 2. GetState(either ctx or event),
-// 3. ChatMessageWithContext(), encapsulate the message blocks with custom id that we store in the cache
-// 4.
+const (
+	slackerEventIDKey contextKey = "slacker_event_id"
+	slackerPayloadKey contextKey = "slacker_payload"
+)
+
+// Slacker is the main struct for managing Slack pipelines and event handling.
+// Parameters:
+// - cache: An in-memory cache for storing step payloads.
+// - socketmodeHandler: The Socket Mode handler for managing Slack events.
+// - logger: A structured logger for logging events and errors.
 type Slacker struct {
 	cache    *cache.Cache
 	shandler *socketmode.SocketmodeHandler
 	logger   *slog.Logger
 }
 
+// New creates a new instance of Slacker with the provided cache, socketmode handler, and logger.
+// Parameters:
+// - cache: An in-memory cache for storing step payloads.
+// - socketmodeHandler: The Socket Mode handler for managing Slack events.
+// - logger: A structured logger for logging events and errors.
+// Returns:
+// - *Slacker: A new instance of the Slacker struct.
 func New(cache *cache.Cache, socketmodeHandler *socketmode.SocketmodeHandler, logger *slog.Logger) *Slacker {
+	contextHandler := &ContextHandler{logger.Handler()}
+
+	// Wrap the handler to existing logger
+	logger = slog.New(contextHandler)
+
 	return &Slacker{
 		cache:    cache,
 		shandler: socketmodeHandler,
@@ -59,9 +52,15 @@ func New(cache *cache.Cache, socketmodeHandler *socketmode.SocketmodeHandler, lo
 	}
 }
 
+// SlackerHandler is a function type for handling Slack events.
+// Extending the socketmode.SocketmodeHandlerFunc to propagate the slacker functionality
 type SlackerHandler func(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error
+
+// SlackerSlashCommandHandler is a function type for handling Slack slash command events.
+// Extending the socketmode.SocketmodeHandlerFunc to propagate the slacker functionality
 type SlackerSlashCommandHandler func(ctx context.Context, payload slack.SlashCommand, c *socketmode.Client) error
 
+// SlackerStep represents a single step in a Slack pipeline, including its name, event type, and handler function.
 type SlackerStep struct {
 	StepName  string
 	EventType socketmode.EventType
@@ -74,6 +73,13 @@ type SlackerStep struct {
 	interactionType slack.InteractionType
 }
 
+// Handle creates a SlackerStep with the specified step name, event type, and handler function.
+// Parameters:
+// - stepName: The name of the step.
+// - eventType: The type of Slack event to handle.
+// - handler: The function to handle the event.
+// Returns:
+// - SlackerStep: A new instance of SlackerStep with the provided parameters.
 func Handle(stepName string, eventType socketmode.EventType, handler SlackerHandler) SlackerStep {
 	return SlackerStep{
 		StepName:  stepName,
@@ -82,6 +88,13 @@ func Handle(stepName string, eventType socketmode.EventType, handler SlackerHand
 	}
 }
 
+// HandleSlashCommand creates a SlackerStep for handling slash command events.
+// Parameters:
+// - stepName: The name of the step.
+// - slashCommand: The specific slash command to handle (e.g., "/invite-user").
+// - handler: The function to handle the slash command event.
+// Returns:
+// - SlackerStep: A new instance of SlackerStep configured for the specified slash command.
 func HandleSlashCommand(stepName string, slashCommand string, handler SlackerSlashCommandHandler) SlackerStep {
 	return SlackerStep{
 		StepName:            stepName,
@@ -91,6 +104,13 @@ func HandleSlashCommand(stepName string, slashCommand string, handler SlackerSla
 	}
 }
 
+// HandleInteraction creates a SlackerStep for handling interaction events.
+// Parameters:
+// - stepName: The name of the step.
+// - interactionType: The specific interaction type to handle (e.g., slack.InteractionTypeViewSubmission).
+// - handler: The function to handle the interaction event.
+// Returns:
+// - SlackerStep: A new instance of SlackerStep configured for the specified interaction type.
 func HandleInteraction(stepName string, interactionType slack.InteractionType, handler SlackerHandler) SlackerStep {
 	return SlackerStep{
 		StepName:        stepName,
@@ -100,12 +120,22 @@ func HandleInteraction(stepName string, interactionType slack.InteractionType, h
 	}
 }
 
+// SlackerContextPayload represents the payload stored in the Slacker context for a specific step.
+// If you have multiple steps in a pipeline, each step's payload will be stored with its step name as the key.
+// To get the payload for a specific step, use slacker.GetStepEvent(ctx, "step_name").
 type SlackerContextPayload struct {
 	StepOrder int
 	StepName  string
 	Payload   *socketmode.Event
 }
 
+// AddPipeline registers a series of SlackerSteps as a pipeline under the given pipeline name.
+// Each step can be a slash command or an interaction handler.
+// The steps will be executed in the order they are provided.
+// The context will be populated with cached events for the pipeline during each step execution.
+// Parameters:
+// - pipelineName: The name of the pipeline to register.
+// - pipelines: A variadic list of SlackerSteps to be included in the pipeline.
 func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
 	for index, step := range pipelines {
@@ -117,8 +147,9 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 			sl.logger.Info("registering slash command", slog.Any("command", step))
 			sl.shandler.HandleSlashCommand(step.slashCommand, func(e *socketmode.Event, c *socketmode.Client) {
 
-				ctx := extractSlackerEventIDToContext(e)
-				ctx = populateContextWithEvents(sl.cache, ctx, pipelineName)
+				ctx := eventContextFromSocketEvent(e)
+				ctx = LoggerWithContext(ctx, sl.logger)
+				ctx = sl.populateContextWithEvents(ctx, pipelineName)
 
 				// Populate the context first
 				// Fill context with new payload
@@ -127,13 +158,21 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
 				payload, ok := e.Data.(slack.SlashCommand)
 				if !ok {
+					sl.logger.Warn("unexpected event data for slash command", slog.Any("data", e.Data))
 					return
 				}
 
-				c.Ack(*e.Request)
+				if e.Request != nil {
+					c.Ack(*e.Request)
+				}
+				sl.logger.DebugContext(ctx, "step.start", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
+
 				err := step.slashCommandHandler(ctx, payload, c)
+
 				if err != nil {
-					sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
+					sl.logger.ErrorContext(ctx, "step.error", slog.String("pipeline", pipelineName), slog.String("step", step.StepName), slog.Any("error", err))
+				} else {
+					sl.logger.DebugContext(ctx, "step.finish", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
 				}
 
 				slackerContextPayload := SlackerContextPayload{
@@ -142,7 +181,7 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 					StepName:  step.StepName,
 				}
 
-				buildSlackerCache(sl.cache, ctx, pipelineName, step.StepName, slackerContextPayload)
+				sl.storeStepPayload(ctx, pipelineName, step.StepName, slackerContextPayload)
 
 			})
 
@@ -150,12 +189,17 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
 			if step.interactionType != "" {
 				sl.shandler.HandleInteraction(step.interactionType, func(e *socketmode.Event, c *socketmode.Client) {
-					ctx := extractSlackerEventIDToContext(e)
-					ctx = populateContextWithEvents(sl.cache, ctx, pipelineName)
+					ctx := eventContextFromSocketEvent(e)
+					ctx = LoggerWithContext(ctx, sl.logger)
+					ctx = sl.populateContextWithEvents(ctx, pipelineName)
+
+					sl.logger.DebugContext(ctx, "step.start", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
 
 					err := step.Handler(ctx, e, c)
 					if err != nil {
-						sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
+						sl.logger.ErrorContext(ctx, "step.error", slog.String("pipeline", pipelineName), slog.String("step", step.StepName), slog.Any("error", err))
+					} else {
+						sl.logger.DebugContext(ctx, "step.finish", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
 					}
 
 					slackerContextPayload := SlackerContextPayload{
@@ -164,7 +208,7 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 						StepName:  step.StepName,
 					}
 
-					buildSlackerCache(sl.cache, ctx, pipelineName, step.StepName, slackerContextPayload)
+					sl.storeStepPayload(ctx, pipelineName, step.StepName, slackerContextPayload)
 
 				})
 			}
@@ -173,12 +217,20 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 	}
 }
 
-// InteractionCallback.View -> View.PrivateMetadata -> Injected with slacker.OpenViewContext()
-// InteractionCallback.PostMessage (Blocks) -> Blocks.Action.ActionID = "slacker_event_id" -> Injected with slacker.ChatMessageWithContext()
+// GetStepEvent retrieves the event payload for a specific step from the context.
+// Parameters:
+// - ctx: The context containing the cached step payloads.
+// - stepName: The name of the step whose event payload is to be retrieved.
+// Returns:
+// - *SlackerContextPayload: The payload associated with the specified step name.
+// - error: An error indicating whether the step event was found or not.
 func GetStepEvent(ctx context.Context, stepName string) (*SlackerContextPayload, error) {
-	value, ok := ctx.Value(SlackerPayloadKey).(slackerCache)
+	valueAny := ctx.Value(slackerPayloadKey)
+	if valueAny == nil {
+		return nil, ErrStepEventNotFound
+	}
 
-	slog.Info("slackercontext", "value", value)
+	value, ok := valueAny.(StorePayload)
 	if !ok {
 		return nil, ErrStepEventNotFound
 	}
@@ -189,13 +241,27 @@ func GetStepEvent(ctx context.Context, stepName string) (*SlackerContextPayload,
 
 	}
 
+	slog.Debug("get_step_event.found", slog.String("step", stepName))
+
 	return &stepPayload, nil
 }
 
+// OpenView opens a modal view with the slacker event ID injected into the view's private metadata.
+// This allows tracking of views related to specific slacker events.
+// Parameters:
+// - ctx: The context containing the slacker event ID.
+// - c: The socketmode client used to open the view.
+// - triggerID: The trigger ID for opening the view.
+// - view: The modal view request to be opened.
+// Returns:
+// - *slack.ViewResponse: The response from the Slack API after opening the view.
+// - error: An error indicating whether the operation was successful or not.
 func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view *slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
-	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
-	fmt.Printf("slackerEventId: %s", slackerEventID)
+	slackerEventID, ok := ctx.Value(slackerEventIDKey).(string)
+	if !ok {
+		slackerEventID = ""
+	}
 	if slackerEventID != "" {
 		view.PrivateMetadata = slackerEventID
 	}
@@ -203,9 +269,21 @@ func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view 
 	return c.OpenView(triggerID, *view)
 }
 
+// OpenViewContext is like OpenView but uses client.OpenViewContext.
+// Parameters:
+// - ctx: The context containing the slacker event ID.
+// - c: The socketmode client used to open the view.
+// - triggerID: The trigger ID for opening the view.
+// - view: The modal view request to be opened.
+// Returns:
+// - *slack.ViewResponse: The response from the Slack API after opening the view.
+// - error: An error indicating whether the operation was successful or not.
 func OpenViewContext(ctx context.Context, c *socketmode.Client, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
-	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
+	slackerEventID, ok := ctx.Value(slackerEventIDKey).(string)
+	if !ok {
+		slackerEventID = ""
+	}
 	if slackerEventID != "" {
 		view.PrivateMetadata = slackerEventID
 	}
@@ -213,14 +291,23 @@ func OpenViewContext(ctx context.Context, c *socketmode.Client, triggerID string
 	return c.OpenViewContext(ctx, triggerID, view)
 }
 
+// PostMessage sends a message to a channel with the slacker event ID injected into the message metadata.
+// This allows tracking of messages related to specific slacker events.
+// Returns:
+// - string: The timestamp of the sent message.
+// - string: The channel ID where the message was sent.
+// - error: An error indicating whether the operation was successful or not.
 func PostMessage(ctx context.Context, client *socketmode.Client, channelID string, options ...slack.MsgOption) (string, string, error) {
 
-	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
+	slackerEventID, ok := ctx.Value(slackerEventIDKey).(string)
+	if !ok {
+		slackerEventID = ""
+	}
 
 	slackerEventMsgOption := slack.MsgOptionMetadata(slack.SlackMetadata{
-		EventType: SlackerEventIDKey,
+		EventType: slackerEventIDKey.String(),
 		EventPayload: map[string]any{
-			SlackerEventIDKey: slackerEventID,
+			slackerEventIDKey.String(): slackerEventID,
 		},
 	})
 
@@ -229,28 +316,36 @@ func PostMessage(ctx context.Context, client *socketmode.Client, channelID strin
 	return client.PostMessage(channelID, options...)
 }
 
-func populateContextWithEvents(c *cache.Cache, ctx context.Context, pipelineName string) context.Context {
+// populateContextWithEvents fills the context with cached events for the given pipeline name.
+// It retrieves the cached events from the Slacker cache and adds them to the context.
+func (sl *Slacker) populateContextWithEvents(ctx context.Context, pipelineName string) context.Context {
 
-	key := buildCacheKey(ctx, pipelineName)
+	key := pipelineCacheKey(ctx, pipelineName)
 
-	payload, ok := c.Get(key)
-	slog.Info("populateContextWithEvents", "payload", payload, "ok", ok)
+	payload, ok := sl.cache.Get(key)
+	sl.logger.DebugContext(ctx, "populateContextWithEvents", slog.Any("payload", payload), slog.Bool("ok", ok))
 	if !ok {
 		return ctx
 	}
 
-	contextPayload := payload.(slackerCache)
+	contextPayload := payload.(StorePayload)
 
-	return context.WithValue(ctx, SlackerPayloadKey, contextPayload)
+	return context.WithValue(ctx, slackerPayloadKey, contextPayload)
 }
 
-func extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
+// extractSlackerEventIDToContext extracts the slacker event ID from the socketmode.Event
+// and returns a new context with the slacker event ID added.
+// this function will run at the beginning of each event handler
+// InteractionTypeView will be extracted from View.PrivateMetadata -> Injected with slacker.OpenViewContext()
+// InteractionTypeBlockActions will be extracted from message metadata -> Injected with slacker.PostMessage()
+func eventContextFromSocketEvent(e *socketmode.Event) context.Context {
 
 	slackerEventId := uuid.NewString()
 
 	ctx := context.Background()
 
 	switch e.Type {
+
 	case socketmode.EventTypeInteractive:
 		payload, ok := e.Data.(slack.InteractionCallback)
 		if !ok {
@@ -261,27 +356,32 @@ func extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
 		case slack.InteractionTypeViewSubmission, slack.InteractionTypeViewClosed:
 			slackerEventId = payload.View.PrivateMetadata
 		case slack.InteractionTypeBlockActions:
-			if eventId, found := extractFromBlockActions(payload.ActionCallback.BlockActions); found {
+			if eventId, found := eventIDFromMessageMetadata(payload.Message.Metadata); found {
 				slackerEventId = eventId
 			}
+			// TODO: handles all interaction types
 		}
 
 	case socketmode.EventTypeEventsAPI:
+		// TODO: handles all event types
 	default:
 	}
 
-	ctx = context.WithValue(ctx, SlackerEventIDKey, slackerEventId)
+	ctx = context.WithValue(ctx, slackerEventIDKey, slackerEventId)
 
 	return ctx
 }
 
-func extractFromBlockActions(blockActions []*slack.BlockAction) (string, bool) {
-	for _, action := range blockActions {
-		// Return when action_id already have slacker_event_id
-		if action.ActionID == SlackerEventIDKey {
-			return action.Value, true
+// eventIDFromBlockActions removed: logic moved to message metadata extraction
+
+// extract slacker event ID from message metadata
+func eventIDFromMessageMetadata(metadata slack.SlackMetadata) (string, bool) {
+	if metadata.EventType == slackerEventIDKey.String() {
+		if eventID, found := metadata.EventPayload[slackerEventIDKey.String()]; found {
+			if eventIDStr, ok := eventID.(string); ok {
+				return eventIDStr, true
+			}
 		}
 	}
-
 	return "", false
 }

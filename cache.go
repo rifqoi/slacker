@@ -5,24 +5,28 @@ import (
 	"fmt"
 	"log/slog"
 	"time"
-
-	"github.com/patrickmn/go-cache"
 )
 
-type slackerCache map[string]SlackerContextPayload
+// StorePayload is the in-memory representation of stored step payloads for a pipeline.
+// It's currently a map[string]SlackerContextPayload but may be converted to an
+// interface in the future to support alternative storage backends.
+type StorePayload map[string]SlackerContextPayload
 
 // cache key is "pipeline_name:slacker_event_id"
-func buildSlackerCache(c *cache.Cache, ctx context.Context, pipelineName, stepName string, payload SlackerContextPayload) {
-	key := buildCacheKey(ctx, pipelineName)
+func (sl *Slacker) storeStepPayload(ctx context.Context, pipelineName, stepName string, payload SlackerContextPayload) {
+	key := pipelineCacheKey(ctx, pipelineName)
 	// Get existing cache, then repopulate the cache with new payload
-	existingCache := getSlackerCache(c, pipelineName, ctx)
+	existingCache := sl.loadPipelineStore(pipelineName, ctx)
 	if existingCache == nil {
 
-		slackerPayloadCache := slackerCache{
+		pipelinePayloadCache := StorePayload{
 			stepName: payload,
 		}
 
-		c.Set(key, slackerPayloadCache, 10*time.Minute)
+		sl.cache.Set(key, pipelinePayloadCache, 10*time.Minute)
+
+		// log creation of new pipeline cache entry
+		sl.logger.DebugContext(ctx, "created new pipeline cache", slog.String("pipeline", pipelineName), slog.String("step", stepName))
 
 		return
 	}
@@ -30,26 +34,36 @@ func buildSlackerCache(c *cache.Cache, ctx context.Context, pipelineName, stepNa
 	ca := *existingCache
 
 	ca[stepName] = payload
-	slog.Info("replacing existing cache", "new_cache", ca, "old_cache", *existingCache)
+	// Use debug-level structured logging with context
+	sl.logger.DebugContext(ctx, "replacing existing cache", slog.Any("new_cache", ca), slog.Any("old_cache", *existingCache))
 
-	c.Replace(key, ca, 10*time.Minute)
+	sl.cache.Replace(key, ca, 10*time.Minute)
 }
 
-func getSlackerCache(c *cache.Cache, pipelineName string, ctx context.Context) *slackerCache {
+func (sl *Slacker) loadPipelineStore(pipelineName string, ctx context.Context) *StorePayload {
 	// Get existing cache
-	key := buildCacheKey(ctx, pipelineName)
+	key := pipelineCacheKey(ctx, pipelineName)
 
-	data, ok := c.Get(key)
+	data, ok := sl.cache.Get(key)
 	if !ok {
 		return nil
 	}
 
-	payload := data.(slackerCache)
+	payload, ok := data.(StorePayload)
+	if !ok {
+		return nil
+	}
 
 	return &payload
 
 }
 
-func buildCacheKey(ctx context.Context, pipelineName string) string {
-	return fmt.Sprintf("%s:%s", pipelineName, ctx.Value(SlackerEventIDKey).(string))
+func pipelineCacheKey(ctx context.Context, pipelineName string) string {
+	slackerEventId, ok := ctx.Value(slackerEventIDKey).(string)
+
+	if !ok {
+		slackerEventId = ""
+	}
+
+	return fmt.Sprintf("%s:%s", pipelineName, slackerEventId)
 }

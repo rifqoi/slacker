@@ -1,13 +1,8 @@
 package slacker
 
-type SlackerError struct {
-	s string
-}
-
-func (s SlackerError) Error() string {
-	return s.s
-}
+import "errors"
 
 var (
-	ErrStepEventNotFound = SlackerError{"step-event-not-found"}
+	// ErrStepEventNotFound is returned when no event payload for a step
+	ErrStepEventNotFound = errors.New("step-event-not-found")
 )
