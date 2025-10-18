@@ -10,7 +10,8 @@ import (
 	"github.com/slack-go/slack/socketmode"
 )
 
-const SlackerEventID string = "slacker_event_id"
+const SlackerEventIDKey string = "slacker_event_id"
+const SlackerPayloadKey string = "slacker_payload"
 
 // We mentioned that there were a few different types of interaction payloads your app might receive.
 // They'll be sent to your specified Request URL in an HTTP POST request in the form application/x-www-form-urlencoded.
@@ -98,15 +99,29 @@ func HandleInteraction(stepName string, interactionType slack.InteractionType, h
 	}
 }
 
+type SlackerContextPayload struct {
+	StepOrder int
+	StepName  string
+	Payload   *socketmode.Event
+}
+
 func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
-	for _, step := range pipelines {
+	for index, step := range pipelines {
+
+		order := index + 1
 
 		switch step.EventType {
 		case socketmode.EventTypeSlashCommand:
 			sl.shandler.HandleSlashCommand(step.slashCommand, func(e *socketmode.Event, c *socketmode.Client) {
 
-				ctx := sl.extractSlackerEventIDToContext(e)
+				ctx := extractSlackerEventIDToContext(e)
+				ctx = populateContextWithEvents(sl.cache, ctx, pipelineName)
+
+				// Populate the context first
+				// Fill context with new payload
+				// Payload =>  pipelineName.[].stepName = event / {"event": "event", "order", 1}
+				// User just call slacker.GetStepEvent("step_name") -> socketmode.Event
 
 				payload, ok := e.Data.(slack.SlashCommand)
 				if !ok {
@@ -118,46 +133,104 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 					sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
 				}
 
+				slackerContextPayload := SlackerContextPayload{
+					StepOrder: order,
+					Payload:   e,
+					StepName:  step.StepName,
+				}
+
+				buildSlackerCache(sl.cache, ctx, pipelineName, step.StepName, slackerContextPayload)
+
 			})
 
 		case socketmode.EventTypeInteractive:
 
 			if step.interactionType != "" {
 				sl.shandler.HandleInteraction(step.interactionType, func(e *socketmode.Event, c *socketmode.Client) {
-					ctx := sl.extractSlackerEventIDToContext(e)
+					ctx := extractSlackerEventIDToContext(e)
+					ctx = populateContextWithEvents(sl.cache, ctx, pipelineName)
 
 					err := step.Handler(ctx, e, c)
 					if err != nil {
 						sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
 					}
 
+					slackerContextPayload := SlackerContextPayload{
+						StepOrder: order,
+						Payload:   e,
+						StepName:  step.StepName,
+					}
+
+					buildSlackerCache(sl.cache, ctx, pipelineName, step.StepName, slackerContextPayload)
+
 				})
 			}
 
 		}
 	}
-
-	// sl.shandler.HandleInteraction(slack.InteractionTypeViewSubmission, func(e *socketmode.Event, c *socketmode.Client) {
-	// 	ctx := sl.extractSlackerEventIDToContext(e)
-	// 	err := fn(ctx, e, c)
-	// 	if err != nil {
-	// 		sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
-	// 	}
-	// })
 }
 
-// InteractionCallback.View -> View.PrivateMetadata
-// InteractionCallback.PostMessage (Blocks) -> Blocks.Action.ActionID = "slacker_event_id"
-func ExampleHandler(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
-	return nil
+// InteractionCallback.View -> View.PrivateMetadata -> Injected with slacker.OpenViewContext()
+// InteractionCallback.PostMessage (Blocks) -> Blocks.Action.ActionID = "slacker_event_id" -> Injected with slacker.ChatMessageWithContext()
+func GetStepEvent(ctx context.Context) (*socketmode.Event, error) {
+	value, ok := ctx.Value(SlackerPayloadKey).(SlackerContextPayload)
+
+	if !ok {
+		return nil, ErrStepEventNotFound
+	}
+
+	return value.Payload, nil
 }
 
-func (sl *Slacker) extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
+func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
-	sl.AddPipeline(
-		"user_internal_invitation",
-		Handle("submit_approval_brand", socketmode.EventTypeInteractive, ExampleHandler),
-	)
+	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
+	if slackerEventID == "" {
+		view.PrivateMetadata = slackerEventID
+	}
+
+	return c.OpenView(triggerID, view)
+}
+
+func OpenViewContext(ctx context.Context, c *socketmode.Client, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
+
+	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
+	if slackerEventID == "" {
+		view.PrivateMetadata = slackerEventID
+	}
+
+	return c.OpenViewContext(ctx, triggerID, view)
+}
+
+func PostMessage(ctx context.Context, client *socketmode.Client, channelID string, options ...slack.MsgOption) (string, string, error) {
+
+	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
+
+	slackerEventMsgOption := slack.MsgOptionMetadata(slack.SlackMetadata{
+		EventType: SlackerEventIDKey,
+		EventPayload: map[string]any{
+			SlackerEventIDKey: slackerEventID,
+		},
+	})
+
+	options = append(options, slackerEventMsgOption)
+
+	return client.PostMessage(channelID, options...)
+}
+
+func populateContextWithEvents(c *cache.Cache, ctx context.Context, pipelineName string) context.Context {
+
+	key := buildCacheKey(ctx, pipelineName)
+
+	payload, ok := c.Get(key)
+	if !ok {
+		return ctx
+	}
+
+	return context.WithValue(ctx, SlackerPayloadKey, payload)
+}
+
+func extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
 
 	slackerEventId := uuid.NewString()
 
@@ -183,7 +256,7 @@ func (sl *Slacker) extractSlackerEventIDToContext(e *socketmode.Event) context.C
 	default:
 	}
 
-	ctx = context.WithValue(ctx, SlackerEventID, slackerEventId)
+	ctx = context.WithValue(ctx, SlackerEventIDKey, slackerEventId)
 
 	return ctx
 }
@@ -191,7 +264,7 @@ func (sl *Slacker) extractSlackerEventIDToContext(e *socketmode.Event) context.C
 func extractFromBlockActions(blockActions []*slack.BlockAction) (string, bool) {
 	for _, action := range blockActions {
 		// Return when action_id already have slacker_event_id
-		if action.ActionID == SlackerEventID {
+		if action.ActionID == SlackerEventIDKey {
 			return action.Value, true
 		}
 	}
