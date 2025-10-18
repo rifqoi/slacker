@@ -31,10 +31,14 @@ func main() {
 
 	socketmodeHandler := socketmode.NewSocketmodeHandler(client)
 
-	slackerHandler := slacker.New(cache, socketmodeHandler, slog.New(slog.Default().Handler()))
+	slackerHandler := slacker.New(cache,
+		socketmodeHandler,
+		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+			Level: slog.LevelDebug,
+		})))
 
 	slackerHandler.AddPipeline("invite_user",
-		slacker.HandleSlashCommand("open_modal", "/invite-user", OpenModal),
+		slacker.HandleSlashCommand("open_modal", "/invite-brand", OpenModal),
 		slacker.HandleInteraction("open_modal_submit_callback", slack.InteractionTypeViewSubmission, OpenModalSubmitCallback),
 	)
 
@@ -62,16 +66,19 @@ func OpenModalSubmitCallback(ctx context.Context, evt *socketmode.Event, c *sock
 		return errors.New("not InteractionCallback event")
 	}
 
+	logger := slacker.LoggerFromContext(ctx)
+
 	if callback.Type != slack.InteractionTypeViewSubmission {
-		slog.Warn("Not InviteBrandCommandViewCallbackId", slog.String("callback_id", callback.CallbackID))
+		logger.WarnContext(ctx, "Not InviteBrandCommandViewCallbackId", "callback_id", callback.CallbackID)
 		return errors.New("Not InviteBrandCommandViewCallbackId")
 	}
 
-	slog.Info("Incoming submission approval modal", "event", evt)
+	logger.InfoContext(ctx, "Incoming submission approval modal")
 
 	view := callback.View.State.Values
-	slog.Info("callback values", slog.Any("view", view))
+	logger.InfoContext(ctx, "callback values", "view", view)
 
+	// Retrieve step event payload from open_modal step
 	stepEvents, err := slacker.GetStepEvent(ctx, "open_modal")
 	if err != nil {
 		return err
@@ -79,9 +86,9 @@ func OpenModalSubmitCallback(ctx context.Context, evt *socketmode.Event, c *sock
 
 	data := stepEvents.Payload.Data.(slack.SlashCommand)
 
-	slog.Info("username", "name", data.UserName, "ts", data.ChannelID)
+	logger.InfoContext(ctx, "username", "name", data.UserName, "ts", data.ChannelID)
 
-	slog.Info("step_events", slog.Any("events", stepEvents))
+	logger.InfoContext(ctx, "step_events", "events", stepEvents)
 
 	c.Ack(*evt.Request)
 
