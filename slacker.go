@@ -2,6 +2,7 @@ package slacker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
@@ -93,7 +94,7 @@ func HandleSlashCommand(stepName string, slashCommand string, handler SlackerSla
 func HandleInteraction(stepName string, interactionType slack.InteractionType, handler SlackerHandler) SlackerStep {
 	return SlackerStep{
 		StepName:        stepName,
-		EventType:       socketmode.EventTypeSlashCommand,
+		EventType:       socketmode.EventTypeInteractive,
 		Handler:         handler,
 		interactionType: interactionType,
 	}
@@ -113,6 +114,7 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
 		switch step.EventType {
 		case socketmode.EventTypeSlashCommand:
+			sl.logger.Info("registering slash command", slog.Any("command", step))
 			sl.shandler.HandleSlashCommand(step.slashCommand, func(e *socketmode.Event, c *socketmode.Client) {
 
 				ctx := extractSlackerEventIDToContext(e)
@@ -128,6 +130,7 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 					return
 				}
 
+				c.Ack(*e.Request)
 				err := step.slashCommandHandler(ctx, payload, c)
 				if err != nil {
 					sl.logger.ErrorContext(ctx, "error-found", slog.Any("error", err))
@@ -172,30 +175,38 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 
 // InteractionCallback.View -> View.PrivateMetadata -> Injected with slacker.OpenViewContext()
 // InteractionCallback.PostMessage (Blocks) -> Blocks.Action.ActionID = "slacker_event_id" -> Injected with slacker.ChatMessageWithContext()
-func GetStepEvent(ctx context.Context) (*socketmode.Event, error) {
-	value, ok := ctx.Value(SlackerPayloadKey).(SlackerContextPayload)
+func GetStepEvent(ctx context.Context, stepName string) (*SlackerContextPayload, error) {
+	value, ok := ctx.Value(SlackerPayloadKey).(slackerCache)
 
+	slog.Info("slackercontext", "value", value)
 	if !ok {
 		return nil, ErrStepEventNotFound
 	}
 
-	return value.Payload, nil
+	stepPayload, found := value[stepName]
+	if !found {
+		return nil, ErrStepEventNotFound
+
+	}
+
+	return &stepPayload, nil
 }
 
-func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
+func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view *slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
 	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
-	if slackerEventID == "" {
+	fmt.Printf("slackerEventId: %s", slackerEventID)
+	if slackerEventID != "" {
 		view.PrivateMetadata = slackerEventID
 	}
 
-	return c.OpenView(triggerID, view)
+	return c.OpenView(triggerID, *view)
 }
 
 func OpenViewContext(ctx context.Context, c *socketmode.Client, triggerID string, view slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
 	slackerEventID := ctx.Value(SlackerEventIDKey).(string)
-	if slackerEventID == "" {
+	if slackerEventID != "" {
 		view.PrivateMetadata = slackerEventID
 	}
 
@@ -223,11 +234,14 @@ func populateContextWithEvents(c *cache.Cache, ctx context.Context, pipelineName
 	key := buildCacheKey(ctx, pipelineName)
 
 	payload, ok := c.Get(key)
+	slog.Info("populateContextWithEvents", "payload", payload, "ok", ok)
 	if !ok {
 		return ctx
 	}
 
-	return context.WithValue(ctx, SlackerPayloadKey, payload)
+	contextPayload := payload.(slackerCache)
+
+	return context.WithValue(ctx, SlackerPayloadKey, contextPayload)
 }
 
 func extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
