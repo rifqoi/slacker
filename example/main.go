@@ -27,39 +27,127 @@ func main() {
 
 	client := socketmode.New(
 		api,
+		// socketmode.OptionDebug(true),
 	)
+
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	logger.Info("Starting Slacker Socketmode Example")
 
 	socketmodeHandler := socketmode.NewSocketmodeHandler(client)
 
 	slackerHandler := slacker.New(cache,
 		socketmodeHandler,
-		slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		})))
-
-	slackerHandler.AddPipeline("invite_user",
-		slacker.HandleSlashCommand("open_modal", "/invite-brand", OpenModal),
-		slacker.HandleInteraction("open_modal_submit_callback", slack.InteractionTypeViewSubmission, OpenModalSubmitCallback),
+		logger,
 	)
 
-	socketmodeHandler.RunEventLoop()
+	socketmodeHandler.HandleDefault(func(e *socketmode.Event, c *socketmode.Client) {
+		return
+	})
+
+	slackerHandler.AddPipeline("invite_user", slacker.AddPipelineOption{
+		OnStart: slacker.OnStartSlashCommand("open_modal", "/invite-brand", OpenModal),
+		Steps: []slacker.SlackerStep{
+			slacker.HandleInteraction("open_modal_submit_callback", slack.InteractionTypeViewSubmission, OpenModalSubmitCallback),
+		},
+		ExpirationTime: 30 * time.Minute,
+	})
+
+	slackerHandler.AddPipeline("merchant_healthcheck", slacker.AddPipelineOption{
+		OnStart: slacker.OnStartShortcut("merchant_healthcheck_open_modal", "merchant_healthcheck", MerchantHealthcheckOpenModal),
+		Steps: []slacker.SlackerStep{
+			slacker.HandleInteraction("open_modal_submit_callback", slack.InteractionTypeViewSubmission, MerchantHealthcheckOpenModalCallback),
+		},
+		ExpirationTime: 30 * time.Minute,
+	})
+
+	err := slackerHandler.RunEventLoop()
+	if err != nil {
+		panic(err)
+	}
 
 }
 
-func OpenModal(ctx context.Context, payload slack.SlashCommand, c *socketmode.Client) error {
+func OpenModal(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
+
+	payload, ok := evt.Data.(slack.SlashCommand)
+	if !ok {
+		return errors.New("not an openmodal command")
+	}
+
+	c.Ack(*evt.Request)
 
 	view, err := generateModalView()
 	if err != nil {
 		return err
 	}
 
-	_, err = slacker.OpenView(ctx, c, payload.TriggerID, view)
+	_, err = slacker.OpenView(ctx, c, payload.TriggerID, "open_modal", view)
 	if err != nil {
 		return err
 	}
 
 	return nil
 }
+
+func MerchantHealthcheckOpenModal(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
+
+	payload, ok := evt.Data.(slack.InteractionCallback)
+	if !ok {
+		return errors.New("not an merchant_healthcheck open command")
+	}
+
+	c.Ack(*evt.Request)
+
+	view, err := generateModalView()
+	if err != nil {
+		return err
+	}
+
+	_, err = slacker.OpenView(ctx, c, payload.TriggerID, "open_modal", view)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func MerchantHealthcheckOpenModalCallback(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
+	callback, ok := evt.Data.(slack.InteractionCallback)
+	if !ok {
+		return errors.New("not InteractionCallback event")
+	}
+
+	logger := slacker.LoggerFromContext(ctx)
+
+	if callback.Type != slack.InteractionTypeViewSubmission && callback.View.CallbackID != "merchant_healthcheck_open_modal" {
+		logger.WarnContext(ctx, "Not MerchantHealthcheckOpenModalCallbackId", "callback_id", callback.CallbackID)
+		return errors.New("Not MerchantHealthcheckOpenModalCallbackId")
+	}
+	logger.InfoContext(ctx, "Incoming submission merchant_healthcheck_open_modal")
+
+	view := callback.View.State.Values
+	logger.InfoContext(ctx, "callback values", "view", view)
+
+	// Retrieve step event payload from open_modal step
+	stepEvents, err := slacker.GetStepEvent(ctx, "merchant_healthcheck_open_modal")
+	if err != nil {
+		return err
+	}
+
+	data := stepEvents.Payload.Data.(slack.InteractionCallback)
+
+	logger.InfoContext(ctx, "data", "channel", data.Channel.ID, "user", data.User.Name, "ts", data.Message.Timestamp, "raw", stepEvents.Payload.Data)
+
+	c.Ack(*evt.Request)
+
+	slacker.PostMessage(ctx, c, data.Channel.ID, slack.MsgOptionText("Sending approval!", false))
+
+	return nil
+}
+
 func OpenModalSubmitCallback(ctx context.Context, evt *socketmode.Event, c *socketmode.Client) error {
 	callback, ok := evt.Data.(slack.InteractionCallback)
 	if !ok {
@@ -68,10 +156,11 @@ func OpenModalSubmitCallback(ctx context.Context, evt *socketmode.Event, c *sock
 
 	logger := slacker.LoggerFromContext(ctx)
 
-	if callback.Type != slack.InteractionTypeViewSubmission {
+	if callback.Type != slack.InteractionTypeViewSubmission && callback.View.CallbackID != "open_modal" {
 		logger.WarnContext(ctx, "Not InviteBrandCommandViewCallbackId", "callback_id", callback.CallbackID)
 		return errors.New("Not InviteBrandCommandViewCallbackId")
 	}
+	// TODO: Should also handle callback_id, if not it will mix with other handlers
 
 	logger.InfoContext(ctx, "Incoming submission approval modal")
 

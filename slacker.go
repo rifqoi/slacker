@@ -3,6 +3,7 @@ package slacker
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/patrickmn/go-cache"
@@ -95,12 +96,12 @@ func Handle(stepName string, eventType socketmode.EventType, handler SlackerHand
 // - handler: The function to handle the slash command event.
 // Returns:
 // - SlackerStep: A new instance of SlackerStep configured for the specified slash command.
-func HandleSlashCommand(stepName string, slashCommand string, handler SlackerSlashCommandHandler) SlackerStep {
+func HandleSlashCommand(stepName string, slashCommand string, handler SlackerHandler) SlackerStep {
 	return SlackerStep{
-		StepName:            stepName,
-		EventType:           socketmode.EventTypeSlashCommand,
-		slashCommand:        slashCommand,
-		slashCommandHandler: handler,
+		StepName:     stepName,
+		EventType:    socketmode.EventTypeSlashCommand,
+		slashCommand: slashCommand,
+		Handler:      handler,
 	}
 }
 
@@ -129,46 +130,223 @@ type SlackerContextPayload struct {
 	Payload   *socketmode.Event
 }
 
-// AddPipeline registers a series of SlackerSteps as a pipeline under the given pipeline name.
-// Each step can be a slash command or an interaction handler.
-// The steps will be executed in the order they are provided.
-// The context will be populated with cached events for the pipeline during each step execution.
-// Parameters:
-// - pipelineName: The name of the pipeline to register.
-// - pipelines: A variadic list of SlackerSteps to be included in the pipeline.
-func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
+type OnStart interface {
+	Valid() error
+	Register(pipelineName string, sl *Slacker) error
+}
 
-	for index, step := range pipelines {
+// type MessagePrefixOnStart struct {
+// 	StepName string
+// 	Prefix   string
+// 	Handler  SlackerHandler
+// }
+//
+// func (s MessagePrefixOnStart) Valid() error {
+// 	if s.Prefix == "" {
+// 		return ErrInvalidOnStart
+// 	}
+//
+// 	if strings.HasPrefix(s.Prefix, "!") {
+// 		return ErrInvalidPrefix
+// 	}
+//
+// 	if s.Handler == nil {
+// 		return ErrInvalidOnStart
+// 	}
+//
+// 	return nil
+// }
+//
+// func (s MessagePrefixOnStart) Register(pipelineName string, sl *Slacker) error {
+// 	sl.shandler.HandleEvents(slackevents.Message, func(e *socketmode.Event, c *socketmode.Client) {
+//
+// 	})
+//
+// 	return nil
+// }
 
-		order := index + 1
+type ShortcutOnStart struct {
+	StepName   string
+	CallbackID string
+	Handler    SlackerHandler
+}
+
+func (s ShortcutOnStart) Valid() error {
+	if s.CallbackID == "" {
+		return ErrInvalidOnStart
+	}
+	if s.Handler == nil {
+		return ErrInvalidOnStart
+	}
+
+	return nil
+}
+
+func (s ShortcutOnStart) Register(pipelineName string, sl *Slacker) error {
+	sl.shandler.HandleInteraction(slack.InteractionTypeShortcut, func(e *socketmode.Event, c *socketmode.Client) {
+
+		ctx, _ := sl.slackerContextFromSocketEvent(pipelineName, e)
+
+		// Check for idempotence
+		if sl.isIdempotenceEvent(ctx, pipelineName, s.CallbackID) {
+			sl.logger.DebugContext(ctx, "onstart.idempotence_skip", slog.String("pipeline", pipelineName), slog.String("callback_id", s.CallbackID))
+			return
+		}
+
+		// Shortcut is of InteractionCallback type
+		payload, ok := e.Data.(slack.InteractionCallback)
+		if !ok {
+			sl.logger.ErrorContext(ctx, "onstart.invalid_event_data", slog.String("pipeline", pipelineName), slog.String("callback_id", s.CallbackID))
+			return
+		}
+
+		// Verify callback ID
+		if payload.CallbackID != s.CallbackID {
+			sl.logger.DebugContext(ctx, "onstart.callback_id_mismatch", slog.String("pipeline", pipelineName), slog.String("expected_callback_id", s.CallbackID), slog.String("received_callback_id", payload.CallbackID))
+			return
+		}
+
+		err := s.Handler(ctx, e, c)
+		if err != nil {
+			sl.logger.ErrorContext(ctx, "onstart.error", slog.String("pipeline", pipelineName), slog.Any("error", err))
+		} else {
+			sl.logger.DebugContext(ctx, "onstart.finish", slog.String("pipeline", pipelineName))
+		}
+
+		slackerContextPayload := SlackerContextPayload{
+			StepOrder: 1,
+			Payload:   e,
+			StepName:  s.CallbackID,
+		}
+		sl.storeStepPayload(ctx, pipelineName, s.StepName, slackerContextPayload)
+		sl.setIdempotenceEvent(ctx, pipelineName, s.StepName)
+	})
+
+	return nil
+}
+
+func OnStartShortcut(stepName, callbackID string, handler SlackerHandler) ShortcutOnStart {
+	return ShortcutOnStart{
+		StepName:   stepName,
+		CallbackID: callbackID,
+		Handler:    handler,
+	}
+}
+
+type SlashCommandOnStart struct {
+	StepName string
+	Command  string
+	Handler  SlackerHandler
+}
+
+func (s SlashCommandOnStart) Valid() error {
+	if s.Command == "" {
+		return ErrInvalidOnStart
+	}
+	if s.Handler == nil {
+		return ErrInvalidOnStart
+	}
+
+	return nil
+}
+
+func (s SlashCommandOnStart) Register(pipelineName string, sl *Slacker) error {
+	sl.shandler.HandleSlashCommand(s.Command, func(e *socketmode.Event, c *socketmode.Client) {
+
+		ctx, _ := sl.slackerContextFromSocketEvent(pipelineName, e)
+		if sl.isIdempotenceEvent(ctx, pipelineName, s.Command) {
+			return
+		}
+
+		err := s.Handler(ctx, e, c)
+		if err != nil {
+			sl.logger.ErrorContext(ctx, "onstart.error", slog.String("pipeline", pipelineName), slog.Any("error", err))
+		} else {
+			sl.logger.DebugContext(ctx, "onstart.finish", slog.String("pipeline", pipelineName))
+		}
+
+		slackerContextPayload := SlackerContextPayload{
+			StepOrder: 1,
+			Payload:   e,
+			StepName:  s.Command,
+		}
+		sl.storeStepPayload(ctx, pipelineName, s.StepName, slackerContextPayload)
+		sl.setIdempotenceEvent(ctx, pipelineName, s.StepName)
+	})
+
+	return nil
+
+}
+
+func OnStartSlashCommand(stepName, command string, handler SlackerHandler) SlashCommandOnStart {
+	return SlashCommandOnStart{
+		StepName: stepName,
+		Command:  command,
+		Handler:  handler,
+	}
+}
+
+type AddPipelineOption struct {
+	// OnStart is a handler that will be called when the pipeline starts.
+	// Only handle SlashCommand or Shortcut events.
+	OnStart        OnStart
+	Steps          []SlackerStep
+	OnEvict        func(pipelineName string, slackerEventID string)
+	ExpirationTime time.Duration
+}
+
+func (sl *Slacker) AddPipeline(pipelineName string, options AddPipelineOption) error {
+	// Register OnStart handler
+	err := options.OnStart.Valid()
+	if err != nil {
+		sl.logger.Error("invalid onstart handler", slog.String("pipeline", pipelineName), slog.Any("error", err))
+
+		return err
+	}
+
+	err = options.OnStart.Register(pipelineName, sl)
+	if err != nil {
+		sl.logger.Error("failed to register onstart handler", slog.String("pipeline", pipelineName), slog.Any("error", err))
+		return err
+	}
+
+	err = sl.registerSlackerSteps(pipelineName, options.Steps)
+	if err != nil {
+		sl.logger.Error("failed to register slacker steps", slog.String("pipeline", pipelineName), slog.Any("error", err))
+		return err
+	}
+
+	return nil
+}
+
+func (sl *Slacker) registerSlackerSteps(pipelineName string, steps []SlackerStep) error {
+	for index, step := range steps {
+		// Step order starts from 2, as 1 is reserved for OnStart
+		order := index + 2
 
 		switch step.EventType {
-		case socketmode.EventTypeSlashCommand:
-			sl.logger.Info("registering slash command", slog.Any("command", step))
-			sl.shandler.HandleSlashCommand(step.slashCommand, func(e *socketmode.Event, c *socketmode.Client) {
+		case socketmode.EventTypeInteractive:
+			if step.interactionType == "" {
+				return ErrInvalidSlackerStep
+			}
+			sl.shandler.HandleInteraction(step.interactionType, func(e *socketmode.Event, c *socketmode.Client) {
+				ctx, isEventExist := sl.slackerContextFromSocketEvent(pipelineName, e)
 
-				ctx := eventContextFromSocketEvent(e)
-				ctx = LoggerWithContext(ctx, sl.logger)
-				ctx = sl.populateContextWithEvents(ctx, pipelineName)
-
-				// Populate the context first
-				// Fill context with new payload
-				// Payload =>  pipelineName.[].stepName = event / {"event": "event", "order", 1}
-				// User just call slacker.GetStepEvent("step_name") -> socketmode.Event
-
-				payload, ok := e.Data.(slack.SlashCommand)
-				if !ok {
-					sl.logger.Warn("unexpected event data for slash command", slog.Any("data", e.Data))
+				if order != 1 && sl.isIdempotenceEvent(ctx, pipelineName, step.StepName) {
+					sl.logger.DebugContext(ctx, "step.idempotence_skip", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
 					return
 				}
 
-				if e.Request != nil {
-					c.Ack(*e.Request)
+				if !isEventExist {
+					sl.logger.DebugContext(ctx, "step.missing_previous_event.skipping", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
+					return
 				}
+
+				// Only handle slacker events
+
 				sl.logger.DebugContext(ctx, "step.start", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
 
-				err := step.slashCommandHandler(ctx, payload, c)
-
+				err := step.Handler(ctx, e, c)
 				if err != nil {
 					sl.logger.ErrorContext(ctx, "step.error", slog.String("pipeline", pipelineName), slog.String("step", step.StepName), slog.Any("error", err))
 				} else {
@@ -182,39 +360,13 @@ func (sl *Slacker) AddPipeline(pipelineName string, pipelines ...SlackerStep) {
 				}
 
 				sl.storeStepPayload(ctx, pipelineName, step.StepName, slackerContextPayload)
-
+				sl.setIdempotenceEvent(ctx, pipelineName, step.StepName)
 			})
-
-		case socketmode.EventTypeInteractive:
-
-			if step.interactionType != "" {
-				sl.shandler.HandleInteraction(step.interactionType, func(e *socketmode.Event, c *socketmode.Client) {
-					ctx := eventContextFromSocketEvent(e)
-					ctx = LoggerWithContext(ctx, sl.logger)
-					ctx = sl.populateContextWithEvents(ctx, pipelineName)
-
-					sl.logger.DebugContext(ctx, "step.start", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
-
-					err := step.Handler(ctx, e, c)
-					if err != nil {
-						sl.logger.ErrorContext(ctx, "step.error", slog.String("pipeline", pipelineName), slog.String("step", step.StepName), slog.Any("error", err))
-					} else {
-						sl.logger.DebugContext(ctx, "step.finish", slog.String("pipeline", pipelineName), slog.String("step", step.StepName))
-					}
-
-					slackerContextPayload := SlackerContextPayload{
-						StepOrder: order,
-						Payload:   e,
-						StepName:  step.StepName,
-					}
-
-					sl.storeStepPayload(ctx, pipelineName, step.StepName, slackerContextPayload)
-
-				})
-			}
 
 		}
 	}
+
+	return nil
 }
 
 // GetStepEvent retrieves the event payload for a specific step from the context.
@@ -256,7 +408,7 @@ func GetStepEvent(ctx context.Context, stepName string) (*SlackerContextPayload,
 // Returns:
 // - *slack.ViewResponse: The response from the Slack API after opening the view.
 // - error: An error indicating whether the operation was successful or not.
-func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view *slack.ModalViewRequest) (*slack.ViewResponse, error) {
+func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, callbackId string, view *slack.ModalViewRequest) (*slack.ViewResponse, error) {
 
 	slackerEventID, ok := ctx.Value(slackerEventIDKey).(string)
 	if !ok {
@@ -265,6 +417,8 @@ func OpenView(ctx context.Context, c *socketmode.Client, triggerID string, view 
 	if slackerEventID != "" {
 		view.PrivateMetadata = slackerEventID
 	}
+
+	view.CallbackID = callbackId
 
 	return c.OpenView(triggerID, *view)
 }
@@ -316,21 +470,30 @@ func PostMessage(ctx context.Context, client *socketmode.Client, channelID strin
 	return client.PostMessage(channelID, options...)
 }
 
+func (sl *Slacker) RunEventLoop() error {
+	return sl.shandler.RunEventLoop()
+}
+
+func (sl *Slacker) slackerContextFromSocketEvent(pipelineName string, e *socketmode.Event) (context.Context, bool) {
+	ctx := extractSlackerEventIDToContext(e)
+	ctx = LoggerWithContext(ctx, sl.logger)
+	ctx, isEventExist := sl.populateContextWithEvents(ctx, pipelineName)
+
+	return ctx, isEventExist
+}
+
 // populateContextWithEvents fills the context with cached events for the given pipeline name.
 // It retrieves the cached events from the Slacker cache and adds them to the context.
-func (sl *Slacker) populateContextWithEvents(ctx context.Context, pipelineName string) context.Context {
+func (sl *Slacker) populateContextWithEvents(ctx context.Context, pipelineName string) (context.Context, bool) {
 
-	key := pipelineCacheKey(ctx, pipelineName)
-
-	payload, ok := sl.cache.Get(key)
-	sl.logger.DebugContext(ctx, "populateContextWithEvents", slog.Any("payload", payload), slog.Bool("ok", ok))
-	if !ok {
-		return ctx
+	payload := sl.loadPipelineStore(pipelineName, ctx)
+	if payload == nil {
+		return ctx, false
 	}
 
-	contextPayload := payload.(StorePayload)
+	contextPayload := *payload
 
-	return context.WithValue(ctx, slackerPayloadKey, contextPayload)
+	return context.WithValue(ctx, slackerPayloadKey, contextPayload), true
 }
 
 // extractSlackerEventIDToContext extracts the slacker event ID from the socketmode.Event
@@ -338,7 +501,7 @@ func (sl *Slacker) populateContextWithEvents(ctx context.Context, pipelineName s
 // this function will run at the beginning of each event handler
 // InteractionTypeView will be extracted from View.PrivateMetadata -> Injected with slacker.OpenViewContext()
 // InteractionTypeBlockActions will be extracted from message metadata -> Injected with slacker.PostMessage()
-func eventContextFromSocketEvent(e *socketmode.Event) context.Context {
+func extractSlackerEventIDToContext(e *socketmode.Event) context.Context {
 
 	slackerEventId := uuid.NewString()
 
@@ -362,8 +525,15 @@ func eventContextFromSocketEvent(e *socketmode.Event) context.Context {
 			// TODO: handles all interaction types
 		}
 
-	case socketmode.EventTypeEventsAPI:
-		// TODO: handles all event types
+	// case socketmode.EventTypeEventsAPI:
+	// 	// TODO: handles all event types
+	// 	switch event := e.Data.(type) {
+	// 	case slackevents.EventsAPIEvent:
+	// 		switch ev := event.InnerEvent.Data.(type) {
+	// 		case *slackevents.MessageEvent:
+	// 		}
+	// 	}
+
 	default:
 	}
 

@@ -35,7 +35,7 @@ func (sl *Slacker) storeStepPayload(ctx context.Context, pipelineName, stepName 
 
 	ca[stepName] = payload
 	// Use debug-level structured logging with context
-	sl.logger.DebugContext(ctx, "replacing existing cache", slog.Any("new_cache", ca), slog.Any("old_cache", *existingCache))
+	sl.logger.DebugContext(ctx, "replacing existing cache", slog.String("key", key), slog.Any("new_cache", ca), slog.Any("old_cache", *existingCache))
 
 	sl.cache.Replace(key, ca, 10*time.Minute)
 }
@@ -66,4 +66,35 @@ func pipelineCacheKey(ctx context.Context, pipelineName string) string {
 	}
 
 	return fmt.Sprintf("%s:%s", pipelineName, slackerEventId)
+}
+
+func (sl *Slacker) isIdempotenceEvent(ctx context.Context, pipelineName string, stepName string) bool {
+
+	eventID, ok := ctx.Value(slackerEventIDKey).(string)
+	if !ok {
+		return false
+	}
+
+	// pipelineName:stepName:eventID
+	key := fmt.Sprintf("%s:%s:%s", pipelineName, stepName, eventID)
+	if _, found := sl.cache.Get(key); found {
+		sl.logger.DebugContext(ctx, "Idempotent Event", slog.String("key", key))
+		return true
+	}
+
+	return false
+}
+
+func (sl *Slacker) setIdempotenceEvent(ctx context.Context, pipelineName string, stepName string) {
+
+	eventID, ok := ctx.Value(slackerEventIDKey).(string)
+	if !ok {
+		return
+	}
+
+	// pipelineName:stepName:eventID
+	key := fmt.Sprintf("%s:%s:%s", pipelineName, stepName, eventID)
+
+	sl.cache.Set(key, true, 5*time.Minute)
+	sl.logger.DebugContext(ctx, "setting up idempotence event", slog.String("key", key))
 }
